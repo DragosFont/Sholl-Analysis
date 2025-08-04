@@ -1,0 +1,9 @@
+aicsimageio==4.14.0
+matplotlib==3.10.1
+Pillow==11.1.0
+numpy==1.26.4
+tifffile==2022.8.12
+imageio==2.34.0
+scikit-image==0.25.2
+flask==3.0.2
+flask-cors==4.0.0
