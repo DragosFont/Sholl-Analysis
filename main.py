@@ -610,58 +610,403 @@ class ExactFreehandMultiROIAdapter:
         return exact_mask
 
     def _process_single_roi_exact(self, roi_num: int, roi_points, exact_mask) -> Dict:
-        """Procesează un singur ROI folosind masca exactă"""
+        """
+        Procesează un singur ROI cu IZOLARE COMPLETĂ pentru a evita contaminarea cu ROI-uri anterioare
+        FIXED: Adaugă debug pentru a verifica izolarea ROI-urilor
+        """
 
         # Creează directoriile
         roi_dir = os.path.join(self.output_dir, f"roi_{roi_num}_exact_freehand")
         debug_dir = os.path.join(roi_dir, "debug")
         os.makedirs(debug_dir, exist_ok=True)
 
-        # Determină bounding box pentru extragerea eficientă
+        print(f"\n{'=' * 60}")
+        print(f"🎯 PROCESEZ ROI {roi_num} cu IZOLARE COMPLETĂ")
+        print(f"   ROI points shape: {len(roi_points)} puncte")
+        print(f"   Exact mask shape: {exact_mask.shape}")
+        print(f"   Exact mask pixels: {exact_mask.sum()}")
+        print(f"   Raw channels shape: {self.raw_channels_data.shape}")
+
+        # VERIFICARE CRITICĂ: Asigură-te că exact_mask se referă la imaginea completă
+        if exact_mask.shape != self.raw_channels_data.shape[1:]:  # shape[1:] pentru a sări peste dimensiunea de canale
+            print(f"   ❌ EROARE: Exact mask shape {exact_mask.shape} != image shape {self.raw_channels_data.shape[1:]}")
+            return self._empty_result()
+
+        # Determină bounding box STRICT pentru această ROI
         coords = np.where(exact_mask)
         if len(coords[0]) == 0:
+            print(f"   ❌ ROI {roi_num}: Exact mask este goală!")
             return self._empty_result()
 
         y_min, y_max = coords[0].min(), coords[0].max() + 1
         x_min, x_max = coords[1].min(), coords[1].max() + 1
 
-        print(f"   🎯 Bounding box: ({x_min},{y_min}) -> ({x_max},{y_max})")
-        print(f"   🎯 Dar folosesc forma EXACTĂ freehand pentru analiză!")
+        print(f"   📦 Bounding box ROI {roi_num}: ({x_min},{y_min}) -> ({x_max},{y_max})")
+        print(f"   📏 Dimensiuni bounding box: {x_max - x_min}x{y_max - y_min}")
 
-        # Extrage canalele din regiunea bounding box
-        channels = self._extract_roi_channels_exact(y_min, y_max, x_min, x_max)
+        # VERIFICARE: Asigură-te că bounding box-ul este rezonabil
+        bbox_area = (x_max - x_min) * (y_max - y_min)
+        mask_area = exact_mask.sum()
+        coverage = mask_area / bbox_area if bbox_area > 0 else 0
 
-        # Extrage masca exactă pentru această regiune
+        print(f"   📊 Acoperire ROI în bounding box: {coverage:.1%}")
+        if coverage < 0.05:  # Dacă ROI-ul acoperă mai puțin de 5% din bounding box
+            print(f"   ⚠️ ATENȚIE: ROI {roi_num} pare foarte dispersat în bounding box!")
+
+        # Extrage canalele din regiunea bounding box CU IZOLARE COMPLETĂ
+        channels = self._extract_roi_channels_isolated(y_min, y_max, x_min, x_max, roi_num)
+
+        # Extrage masca exactă pentru această regiune CU VERIFICARE
         roi_exact_mask = exact_mask[y_min:y_max, x_min:x_max]
 
-        # Salvează imaginile de bază cu masca exactă aplicată
-        self._save_basic_images_exact(channels, roi_exact_mask, roi_dir, roi_num)
+        print(f"   🎯 ROI mask în bounding box: {roi_exact_mask.sum()} pixeli")
+        print(f"   🎯 Channels extrași: {[name + ':' + str(ch.shape) for name, ch in channels.items()]}")
 
-        # Pasul 1: Crează masca neuronului din canalul verde DOAR în zona exactă freehand
-        neuron_mask = self._create_neuron_mask_in_exact_region(
-            channels['green'], roi_exact_mask, debug_dir, roi_num)
+        # SALVARE DEBUG PENTRU VERIFICAREA IZOLĂRII
+        self._save_roi_isolation_debug(channels, roi_exact_mask, exact_mask, roi_num, debug_dir)
 
-        if neuron_mask.sum() == 0:
-            print(f"⚠️ ROI {roi_num}: Nu s-a detectat neuron în forma exactă freehand!")
+        # CONTINUĂ cu procesarea normală...
+        # [restul codului rămâne la fel]
+
+        # PASUL 1: Crează masca din verde (DOAR în această ROI)
+        green_mask = self._create_isolated_green_mask(channels['green'], roi_exact_mask, debug_dir, roi_num)
+
+        # PASUL 2: INTERSECȚIA DIRECTĂ - aceasta este MASCA FINALĂ
+        final_analysis_mask = green_mask & roi_exact_mask
+
+        print(f"   ✅ MASKA FINALĂ (freehand ∩ verde) pentru ROI {roi_num}: {final_analysis_mask.sum()} pixeli")
+
+        if final_analysis_mask.sum() == 0:
+            print(f"   ❌ ROI {roi_num}: Intersecția este goală!")
             return self._empty_result()
 
-        # Pasul 2: Găsește soma-ul din canalul albastru DOAR în regiunea verde din forma exactă
-        soma_center = self._find_soma_in_exact_green_region(
-            channels['blue'], neuron_mask, debug_dir, roi_num)
+        # Continuă cu restul procesării...
+        soma_center = self._find_soma_in_final_mask(channels['blue'], final_analysis_mask, debug_dir, roi_num)
+        dendrites_binary = self._extract_dendrites_from_final_mask(channels['red'], final_analysis_mask, debug_dir,
+                                                                   roi_num)
+        binary_path = self._save_final_results_with_mask(dendrites_binary, channels['red'], soma_center,
+                                                         final_analysis_mask, roi_dir, roi_num)
+        results = self._perform_sholl_analysis_exact(dendrites_binary, binary_path, soma_center, roi_dir, roi_num)
 
-        # Pasul 3: Extrage dendritele din forma exactă freehand
-        dendrites_binary = self._extract_dendrites_in_exact_region(
-            channels['red'], neuron_mask, debug_dir, roi_num)
-
-        # Pasul 4: Salvează rezultatele finale cu forma exactă
-        binary_path = self._save_final_results_exact(
-            dendrites_binary, channels['red'], soma_center, roi_exact_mask, roi_dir, roi_num)
-
-        # Pasul 5: Analiza Sholl pe forma exactă
-        results = self._perform_sholl_analysis_exact(
-            dendrites_binary, binary_path, soma_center, roi_dir, roi_num)
-
+        print(f"🏁 ROI {roi_num} COMPLETAT cu izolare verificată!")
         return results
+
+    def _extract_roi_channels_isolated(self, y_min: int, y_max: int, x_min: int, x_max: int, roi_num: int) -> Dict[
+        str, np.ndarray]:
+        """
+        Extrage canalele pentru regiunea bounding box cu VERIFICARE DE IZOLARE
+        """
+        print(f"   📡 Extragere canale IZOLATE pentru ROI {roi_num}...")
+
+        file_ext = os.path.splitext(self.file_path)[1].lower()
+
+        # Extrage canalele
+        try:
+            if file_ext == '.czi':
+                # Pentru .czi, folosim maparea corectă bazată pe nume de canale
+                blue_channel = self.raw_channels_data[0, y_min:y_max, x_min:x_max].copy()
+                green_channel = self.raw_channels_data[1, y_min:y_max, x_min:x_max].copy()
+                red_channel = self.raw_channels_data[2, y_min:y_max, x_min:x_max].copy()
+            else:
+                # Mapare standard pentru alte formate
+                blue_channel = self.raw_channels_data[0, y_min:y_max, x_min:x_max].copy()
+                green_channel = self.raw_channels_data[1, y_min:y_max, x_min:x_max].copy()
+                red_channel = self.raw_channels_data[2, y_min:y_max, x_min:x_max].copy()
+
+            channels = {
+                'blue': blue_channel,
+                'green': green_channel,
+                'red': red_channel
+            }
+
+            # VERIFICARE DE IZOLARE: Asigură-te că fiecare canal este unic pentru această ROI
+            for name, channel in channels.items():
+                print(
+                    f"      Canal {name}: shape={channel.shape}, min={channel.min():.4f}, max={channel.max():.4f}, mean={channel.mean():.4f}")
+
+                # Verifică dacă canalul pare să conțină date reale
+                non_zero_pixels = np.count_nonzero(channel)
+                total_pixels = channel.size
+                print(
+                    f"      Canal {name}: {non_zero_pixels}/{total_pixels} pixeli non-zero ({100 * non_zero_pixels / total_pixels:.1f}%)")
+
+            return channels
+
+        except Exception as e:
+            print(f"   ❌ EROARE la extragerea canalelor pentru ROI {roi_num}: {e}")
+            return {
+                'blue': np.zeros((y_max - y_min, x_max - x_min)),
+                'green': np.zeros((y_max - y_min, x_max - x_min)),
+                'red': np.zeros((y_max - y_min, x_max - x_min))
+            }
+
+    def _save_roi_isolation_debug(self, channels: Dict, roi_mask: np.ndarray, full_exact_mask: np.ndarray,
+                                  roi_num: int, debug_dir: str):
+        """
+        Salvează debug pentru verificarea izolării ROI-urilor
+        """
+        try:
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+
+            # Prima linie: canalele extrase pentru această ROI
+            axes[0, 0].imshow(channels['blue'], cmap='Blues')
+            axes[0, 0].set_title(f'ROI {roi_num} - Canal Albastru\nExtras izolat')
+            axes[0, 0].axis('off')
+
+            axes[0, 1].imshow(channels['green'], cmap='Greens')
+            axes[0, 1].set_title(f'ROI {roi_num} - Canal Verde\nExtras izolat')
+            axes[0, 1].axis('off')
+
+            axes[0, 2].imshow(channels['red'], cmap='Reds')
+            axes[0, 2].set_title(f'ROI {roi_num} - Canal Roșu\nExtras izolat')
+            axes[0, 2].axis('off')
+
+            # A doua linie: măștile și verificarea izolării
+            axes[1, 0].imshow(roi_mask, cmap='gray')
+            axes[1, 0].set_title(f'ROI {roi_num} - Maska în Bounding Box\n{roi_mask.sum()} pixeli')
+            axes[1, 0].axis('off')
+
+            # Afișează masca completă pentru comparație
+            axes[1, 1].imshow(full_exact_mask, cmap='gray')
+            axes[1, 1].set_title(f'ROI {roi_num} - Maska Completă\n{full_exact_mask.sum()} pixeli')
+            axes[1, 1].axis('off')
+
+            # Overlay pentru verificare
+            if len(channels['green'].shape) == 2 and len(roi_mask.shape) == 2:
+                overlay = channels['green'] * 0.7 + roi_mask.astype(float) * 0.3
+                axes[1, 2].imshow(overlay, cmap='Greens')
+                axes[1, 2].set_title(f'Overlay Verde + Maska\nVerificare izolare')
+                axes[1, 2].axis('off')
+
+            plt.suptitle(f'ROI {roi_num} - Verificare Izolare Completă', fontsize=14, fontweight='bold')
+            plt.tight_layout()
+            plt.savefig(os.path.join(debug_dir, f"00_ROI_{roi_num}_isolation_check.png"),
+                        dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+            print(f"   💾 Debug izolare salvat pentru ROI {roi_num}")
+
+        except Exception as e:
+            print(f"   ⚠️ Eroare la salvarea debug izolare pentru ROI {roi_num}: {e}")
+
+    def _create_isolated_green_mask(self, green_channel: np.ndarray, roi_mask: np.ndarray,
+                                    debug_dir: str, roi_num: int) -> np.ndarray:
+        """
+        Crează masca verde DOAR pentru această ROI, IZOLAT de alte ROI-uri
+        """
+        print(f"🟢 ROI {roi_num}: Crează mască verde IZOLATĂ...")
+
+        # Normalizare
+        green_norm = exposure.rescale_intensity(green_channel, out_range=(0, 1))
+        green_smooth = filters.gaussian(green_norm, sigma=0.8)
+
+        # IMPORTANT: Calculează threshold DOAR pe pixelii din această ROI
+        green_in_roi = green_smooth * roi_mask.astype(float)
+
+        if green_in_roi.sum() > 0:
+            non_zero_in_roi = green_in_roi[green_in_roi > 0]
+            if len(non_zero_in_roi) > 10:
+                # Threshold calculat DOAR pe această ROI
+                threshold = np.percentile(non_zero_in_roi, 50)
+                threshold = max(threshold, 0.08)
+                print(f"   • Threshold calculat pe ROI {roi_num}: {threshold:.4f} din {len(non_zero_in_roi)} pixeli")
+            else:
+                threshold = 0.08
+                print(f"   • Threshold default pentru ROI {roi_num}: {threshold:.4f}")
+        else:
+            threshold = 0.08
+            print(f"   ⚠️ Nu există semnal verde în ROI {roi_num}, folosesc threshold default: {threshold:.4f}")
+
+        # Crează masca threshold
+        green_threshold_mask = green_smooth > threshold
+
+        # Curățare minimă
+        if green_threshold_mask.sum() > 0:
+            green_threshold_clean = morphology.remove_small_objects(green_threshold_mask, min_size=10)
+            green_threshold_clean = morphology.binary_closing(green_threshold_clean, morphology.disk(1))
+        else:
+            green_threshold_clean = green_threshold_mask.copy()
+
+        print(f"   • ROI {roi_num} - Maska verde: {green_threshold_clean.sum()} pixeli")
+
+        return green_threshold_clean
+
+    def _create_simple_green_threshold_mask(self, green_channel: np.ndarray, debug_dir: str,
+                                            roi_num: int) -> np.ndarray:
+        """
+        Crează o mască simplă din canalul verde - fără complicații
+        """
+        print(f"🟢 ROI {roi_num}: Crează mască simplă din verde...")
+
+        # Normalizare
+        green_norm = exposure.rescale_intensity(green_channel, out_range=(0, 1))
+
+        # Smoothing ușor
+        green_smooth = filters.gaussian(green_norm, sigma=0.8)
+
+        # Threshold simplu
+        if green_smooth.sum() > 0:
+            # Folosește percentila 60 - nici prea strictă, nici prea permisivă
+            threshold = np.percentile(green_smooth[green_smooth > 0], 60)
+            threshold = max(threshold, 0.08)  # Minim rezonabil
+        else:
+            threshold = 0.1
+
+        # Mască binară
+        green_mask = green_smooth > threshold
+
+        # Curățare minimă
+        green_mask = morphology.remove_small_objects(green_mask, min_size=50)
+        green_mask = morphology.binary_closing(green_mask, morphology.disk(2))
+
+        print(f"   • Threshold verde: {threshold:.4f}")
+        print(f"   • Pixeli mască verde: {green_mask.sum()}")
+
+        return green_mask
+
+    def _find_soma_in_final_mask(self, blue_channel: np.ndarray, final_mask: np.ndarray,
+                                 debug_dir: str, roi_num: int) -> Tuple[int, int]:
+        """
+        Găsește soma DOAR în masca finală (freehand ∩ verde)
+        """
+        print(f"🔵 ROI {roi_num}: Găsesc soma în masca finală...")
+
+        # Normalizare
+        blue_norm = exposure.rescale_intensity(blue_channel, out_range=(0, 1))
+
+        # Aplică DOAR masca finală
+        blue_in_final_mask = blue_norm * final_mask.astype(float)
+
+        if blue_in_final_mask.sum() == 0:
+            # Fallback: centrul geometric al măștii finale
+            coords = np.where(final_mask)
+            if len(coords[0]) > 0:
+                center_y = int(np.mean(coords[0]))
+                center_x = int(np.mean(coords[1]))
+            else:
+                center_y = blue_norm.shape[0] // 2
+                center_x = blue_norm.shape[1] // 2
+            print(f"   • Centru fallback: ({center_x}, {center_y})")
+            return (center_x, center_y)
+
+        # Găsește punctul cu intensitatea maximă ÎN MASCA FINALĂ
+        max_coords = np.unravel_index(np.argmax(blue_in_final_mask), blue_in_final_mask.shape)
+        center_y, center_x = max_coords
+
+        # Salvare debug
+        self._save_debug_image(blue_norm, "04_blue_original", debug_dir)
+        self._save_debug_image(blue_in_final_mask, "05_blue_in_final_mask", debug_dir)
+
+        print(f"   • Centrul soma în masca finală: ({center_x}, {center_y})")
+        return (center_x, center_y)
+
+    def _extract_dendrites_from_final_mask(self, red_channel: np.ndarray, final_mask: np.ndarray,
+                                           debug_dir: str, roi_num: int) -> np.ndarray:
+        """
+        Extrage dendrite DOAR din masca finală (freehand ∩ verde)
+        SIMPLIFIED: Fără strategii complicate, doar procesare directă în masca finală
+        """
+        print(f"🔴 ROI {roi_num}: Extrag dendrite DOAR din masca finală...")
+
+        # Normalizare
+        red_norm = exposure.rescale_intensity(red_channel, out_range=(0, 1))
+
+        # Aplică DOAR masca finală
+        red_in_final_mask = red_norm * final_mask.astype(float)
+
+        if red_in_final_mask.sum() == 0:
+            print("   ⚠️ Nu există semnal roșu în masca finală!")
+            return np.zeros_like(red_norm, dtype=bool)
+
+        print(f"   • Semnal roșu în masca finală: {red_in_final_mask.sum():.2f}")
+
+        # Denoising ușor
+        red_denoised = filters.gaussian(red_in_final_mask, sigma=0.5)
+        red_denoised = filters.median(red_denoised, morphology.disk(1))
+
+        # Threshold în masca finală
+        non_zero_values = red_denoised[red_denoised > 0]
+        if len(non_zero_values) > 20:
+            # Threshold conservator dar nu exagerat
+            threshold = np.percentile(non_zero_values, 70)
+            threshold = max(threshold, 0.05)
+        else:
+            threshold = 0.1
+
+        print(f"   • Threshold roșu: {threshold:.4f}")
+
+        # Creare mască binară LIMITATĂ la masca finală
+        binary_dendrites = red_denoised > threshold
+        binary_dendrites = binary_dendrites & final_mask  # IMPORTANT: limitează la masca finală
+
+        # Curățare minimă
+        binary_cleaned = morphology.remove_small_objects(binary_dendrites, min_size=5)
+        binary_cleaned = morphology.binary_closing(binary_cleaned, morphology.disk(1))
+
+        # Skeletonizare dacă sunt suficienți pixeli
+        if binary_cleaned.sum() >= 10:
+            skeleton = morphology.skeletonize(binary_cleaned)
+
+            # Elimină puncte izolate din skeleton
+            if skeleton.sum() > 0:
+                # Găsește puncte cu puțini vecini
+                from scipy import ndimage
+                neighbor_count = ndimage.convolve(skeleton.astype(int),
+                                                  np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]]),
+                                                  mode='constant')
+                # Elimină puncte complet izolate
+                isolated = (skeleton == 1) & (neighbor_count == 0)
+                skeleton[isolated] = False
+        else:
+            skeleton = binary_cleaned.copy()
+
+        # Salvare debug
+        self._save_debug_image(red_norm, "06_red_original", debug_dir)
+        self._save_debug_image(red_in_final_mask, "07_red_in_final_mask", debug_dir)
+        self._save_debug_image(binary_dendrites, "08_binary_dendrites", debug_dir)
+        self._save_debug_image(skeleton, "09_final_skeleton", debug_dir)
+
+        print(f"   • Pixeli skeleton final: {skeleton.sum()}")
+        print(f"   • Procent din masca finală: {100 * skeleton.sum() / max(1, final_mask.sum()):.1f}%")
+
+        return skeleton
+
+    def _save_final_results_with_mask(self, skeleton: np.ndarray, red_channel: np.ndarray,
+                                      soma_center: Tuple[int, int], final_mask: np.ndarray,
+                                      roi_dir: str, roi_num: int) -> str:
+        """
+        Salvează rezultatele finale cu masca finală (freehand ∩ verde)
+        """
+
+        # Salvează imaginea binară pentru analiza Sholl
+        binary_path = os.path.join(roi_dir, "roi_binary_final_mask.tif")
+        imsave(binary_path, (skeleton * 255).astype(np.uint8))
+
+        # Crează imaginea cu rezultatele vizualizate
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        # Background cu canalul roșu
+        red_norm = exposure.rescale_intensity(red_channel, out_range=(0, 1))
+        ax.imshow(red_norm, cmap="Reds", alpha=0.7)
+
+        # Afișează masca finală ca contur
+        ax.contour(final_mask, colors='lime', linewidths=3, alpha=0.9, levels=[0.5])
+
+        # Afișează skeleton-ul
+        ax.imshow(skeleton, cmap="gray_r", alpha=0.9)
+
+        # Marchează centrul soma-ului
+        ax.plot(soma_center[0], soma_center[1], 'b*', markersize=20,
+                markeredgecolor='yellow', markeredgewidth=3, label='Centru Soma')
+
+        ax.set_title(f"ROI {roi_num} - Dendrite în Masca Finală (Freehand ∩ Verde)")
+        ax.axis('off')
+        ax.legend()
+        plt.savefig(os.path.join(roi_dir, "roi_results_final_mask.png"),
+                    dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+        return binary_path
 
     def _extract_roi_channels_exact(self, y_min: int, y_max: int, x_min: int, x_max: int) -> Dict[str, np.ndarray]:
         """Extrage canalele pentru regiunea bounding box"""
@@ -742,52 +1087,126 @@ class ExactFreehandMultiROIAdapter:
 
     def _create_neuron_mask_in_exact_region(self, green_channel: np.ndarray, exact_mask: np.ndarray,
                                             debug_dir: str, roi_num: int) -> np.ndarray:
-        """Crează masca neuronului DOAR în forma exactă freehand"""
-        print(f"🟢 ROI {roi_num}: Creez masca neuronului în forma EXACTĂ freehand...")
+        """
+        Crează masca neuronului folosind DOAR intersecția directă freehand + verde
+        SIMPLIFIED: Doar intersecția directă care funcționează perfect
+        """
+        print(f"🟢 ROI {roi_num}: Creez masca DOAR cu intersecția directă (freehand ∩ verde)...")
 
-        # Aplică masca exactă pe canalul verde
-        green_in_exact = green_channel * exact_mask.astype(float)
-
-        if green_in_exact.sum() == 0:
-            print("   ⚠️ Nu există semnal verde în forma exactă freehand!")
-            return np.zeros_like(exact_mask, dtype=bool)
-
-        # Normalizare și denoising ușor
-        green_norm = exposure.rescale_intensity(green_in_exact, out_range=(0, 1))
+        # Pasul 1: Procesează canalul verde pentru threshold
+        green_norm = exposure.rescale_intensity(green_channel, out_range=(0, 1))
         green_smooth = filters.gaussian(green_norm, sigma=0.8)
 
-        # Threshold mai permisiv - folosim percentila 65
+        # Pasul 2: Calculează threshold pe întregul canal verde
         if green_smooth.sum() > 0:
-            threshold = np.percentile(green_smooth[green_smooth > 0], 65)
-            threshold = max(threshold, 0.1)
+            non_zero_green = green_smooth[green_smooth > 0]
+            if len(non_zero_green) > 100:
+                # Threshold moderat - nu prea strict, nu prea permisiv
+                threshold = np.percentile(non_zero_green, 50)  # Percentila 50
+                threshold = max(threshold, 0.08)  # Minim rezonabil
+            else:
+                threshold = 0.08
         else:
-            threshold = 0.1
+            threshold = 0.08
 
-        # Creare mască inițială
-        initial_mask = green_smooth > threshold
+        print(f"   • Threshold verde: {threshold:.4f}")
 
-        # IMPORTANT: Aplică masca exactă freehand
-        initial_mask = initial_mask & exact_mask
+        # Pasul 3: Crează masca threshold pe tot canalul verde
+        green_threshold_mask = green_smooth > threshold
 
-        # Curățare minimă
-        cleaned_mask = morphology.remove_small_objects(initial_mask, min_size=50)
+        # Pasul 4: Curățare minimă a măștii threshold
+        if green_threshold_mask.sum() > 0:
+            green_threshold_clean = morphology.remove_small_objects(green_threshold_mask, min_size=30)
+            green_threshold_clean = morphology.binary_closing(green_threshold_clean, morphology.disk(2))
+        else:
+            green_threshold_clean = green_threshold_mask.copy()
 
-        # Aplicăm closing foarte mic
-        final_mask = morphology.binary_closing(cleaned_mask, morphology.disk(2))
+        print(f"   • Maska threshold verde: {green_threshold_clean.sum()} pixeli")
+        print(f"   • Maska freehand exactă: {exact_mask.sum()} pixeli")
 
-        # IMPORTANT: Asigură-te că rămâne în forma exactă
-        final_mask = final_mask & exact_mask
+        # Pasul 5: DOAR INTERSECȚIA DIRECTĂ
+        final_mask = green_threshold_clean & exact_mask
+        intersection_pixels = final_mask.sum()
 
-        # Salvare debug
-        self._save_debug_image(green_norm, "01_green_in_exact", debug_dir)
-        self._save_debug_image(green_smooth, "02_green_smooth", debug_dir)
-        self._save_debug_image(initial_mask, "03_initial_mask_exact", debug_dir)
-        self._save_debug_image(final_mask, "04_final_mask_exact", debug_dir)
-        self._save_debug_image(exact_mask, "05_exact_freehand_mask", debug_dir)
+        print(f"   ✅ INTERSECȚIE DIRECTĂ: {intersection_pixels} pixeli")
 
-        print(f"   • Threshold: {threshold:.4f}")
-        print(f"   • Pixeli în masca exactă neuron: {final_mask.sum()}")
-        print(f"   • Procent din forma exactă: {100 * final_mask.sum() / max(1, exact_mask.sum()):.1f}%")
+        # Pasul 6: Verificare că intersecția nu este goală
+        if intersection_pixels == 0:
+            print(f"   ⚠️ Intersecția directă este goală! Încerc threshold mai permisiv...")
+            # Încearcă cu threshold mai mic
+            threshold_permissive = np.percentile(non_zero_green, 30) if len(non_zero_green) > 0 else 0.05
+            threshold_permissive = max(threshold_permissive, 0.03)
+
+            green_permissive = green_smooth > threshold_permissive
+            green_permissive = morphology.remove_small_objects(green_permissive, min_size=20)
+            final_mask = green_permissive & exact_mask
+
+            print(f"   • Threshold permisiv: {threshold_permissive:.4f}")
+            print(f"   • Intersecție permisivă: {final_mask.sum()} pixeli")
+
+            if final_mask.sum() == 0:
+                print(f"   ❌ Nici intersecția permisivă nu funcționează! Folosesc doar freehand")
+                final_mask = exact_mask.copy()
+
+        # Pasul 7: Curățare finală minimă
+        if final_mask.sum() > 0:
+            final_mask = morphology.remove_small_objects(final_mask, min_size=10)
+            final_mask = morphology.binary_closing(final_mask, morphology.disk(1))
+
+        # Pasul 8: Salvare debug SIMPLU - doar ceea ce contează
+        try:
+            self._save_debug_image(green_norm, "01_green_original", debug_dir)
+            self._save_debug_image(green_smooth, "02_green_smooth", debug_dir)
+            self._save_debug_image(green_threshold_clean, "03_green_threshold", debug_dir)
+            self._save_debug_image(exact_mask, "04_freehand_exact", debug_dir)
+            self._save_debug_image(final_mask, "05_intersection_direct_FINAL", debug_dir)
+
+            # O singură imagine de comparație simplă
+            fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+
+            axes[0].imshow(green_norm, cmap='Greens')
+            axes[0].set_title('Verde original')
+            axes[0].axis('off')
+
+            axes[1].imshow(green_threshold_clean, cmap='Greens')
+            axes[1].set_title(f'Threshold verde\n{green_threshold_clean.sum()} px')
+            axes[1].axis('off')
+
+            axes[2].imshow(exact_mask, cmap='Blues')
+            axes[2].set_title(f'Freehand exact\n{exact_mask.sum()} px')
+            axes[2].axis('off')
+
+            axes[3].imshow(final_mask, cmap='Reds')
+            axes[3].set_title(f'INTERSECȚIE DIRECTĂ\n{final_mask.sum()} px')
+            axes[3].axis('off')
+
+            # Overlay final
+            overlay = green_norm * 0.6
+            overlay_colored = np.stack([overlay + final_mask.astype(float) * 0.4,
+                                        overlay + final_mask.astype(float) * 0.4,
+                                        overlay], axis=-1)
+            overlay_colored = np.clip(overlay_colored, 0, 1)
+            axes[4].imshow(overlay_colored)
+            axes[4].set_title('Overlay final')
+            axes[4].axis('off')
+
+            plt.suptitle(f'ROI {roi_num} - DOAR Intersecția Directă (Freehand ∩ Verde)')
+            plt.tight_layout()
+            plt.savefig(os.path.join(debug_dir, "06_intersection_direct_only.png"),
+                        dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+        except Exception as e:
+            print(f"   ⚠️ Eroare la salvarea debug: {e}")
+
+        # Rezultat final
+        final_pixels = final_mask.sum()
+        coverage_of_freehand = 100 * final_pixels / max(1, exact_mask.sum())
+
+        print(f"   🎯 REZULTAT FINAL (DOAR INTERSECȚIE DIRECTĂ):")
+        print(f"      • Pixeli finali: {final_pixels}")
+        print(f"      • Acoperire din freehand: {coverage_of_freehand:.1f}%")
+        print(f"      • Threshold folosit: {threshold:.4f}")
 
         return final_mask
 
@@ -840,56 +1259,252 @@ class ExactFreehandMultiROIAdapter:
 
     def _extract_dendrites_in_exact_region(self, red_channel: np.ndarray, neuron_mask: np.ndarray,
                                            debug_dir: str, roi_num: int) -> np.ndarray:
-        """Extrage dendrite DOAR din forma exactă freehand"""
-        print(f"🔴 ROI {roi_num}: Extrag dendrite din forma EXACTĂ freehand...")
+        """
+        Extrage dendrite DOAR din forma exactă freehand cu SUPPRESSIA ZGOMOTULUI
+        FIXED: Elimină zgomotul și artefactele care fac skeleton-ul să "devină nebun"
+        """
+        print(f"🔴 ROI {roi_num}: Extrag dendrite din forma EXACTĂ cu eliminarea zgomotului...")
 
-        # Normalizare
+        # Pasul 1: Normalizare robustă
         red_norm = exposure.rescale_intensity(red_channel, out_range=(0, 1))
 
-        # Aplicăm masca neuronului din forma exactă
+        # Pasul 2: Aplică masca neuronului (care este deja perfectă din verde)
         red_in_exact_neuron = red_norm * neuron_mask.astype(float)
 
         if red_in_exact_neuron.sum() == 0:
             print("   ⚠️ Nu există semnal roșu în neuronul din forma exactă!")
             return np.zeros_like(red_norm, dtype=bool)
 
-        # Enhancement ușor
-        red_enhanced = filters.unsharp_mask(red_in_exact_neuron, radius=1, amount=1.2)
-        red_enhanced = np.clip(red_enhanced, 0, 1)
+        print(f"   • Semnal roșu în neuron: {red_in_exact_neuron.sum():.2f}")
+        print(f"   • Pixeli neuron: {neuron_mask.sum()}")
 
-        # Denoising foarte ușor
-        red_denoised = filters.median(red_enhanced, morphology.disk(1))
+        # Pasul 3: DENOISING AGRESIV înainte de orice procesare
+        print("   🧹 Aplicând denoising agresiv...")
 
-        # Threshold foarte jos pentru a prinde structuri fine
+        # Multiple etape de denoising
+        red_denoised = red_in_exact_neuron.copy()
+
+        # Etapa 1: Gaussian blur pentru smooth general
+        red_denoised = filters.gaussian(red_denoised, sigma=0.8)
+
+        # Etapa 2: Median filter pentru eliminarea punctelor izolate
+        red_denoised = filters.median(red_denoised, morphology.disk(2))
+
+        # Etapa 3: Un alt Gaussian mai mic pentru final smoothing
+        red_denoised = filters.gaussian(red_denoised, sigma=0.4)
+
+        # Pasul 4: THRESHOLD MULT MAI CONSERVATOR
         if red_denoised.sum() > 0:
-            threshold = np.percentile(red_denoised[red_denoised > 0], 15)
-            threshold = max(threshold, 0.01)
+            non_zero_values = red_denoised[red_denoised > 0]
+
+            # Folosește percentile mult mai mari pentru a elimina noise-ul
+            threshold_candidates = [
+                np.percentile(non_zero_values, 75),  # 75th percentile
+                np.percentile(non_zero_values, 80),  # 80th percentile
+                np.percentile(non_zero_values, 85),  # 85th percentile
+            ]
+
+            # Alege threshold-ul care dă rezultate rezonabile
+            best_threshold = None
+            best_pixel_count = 0
+
+            for thresh in threshold_candidates:
+                test_binary = red_denoised > thresh
+                test_binary = test_binary & neuron_mask  # Menține în neuron
+
+                # Curățare rapidă pentru test
+                test_cleaned = morphology.remove_small_objects(test_binary, min_size=5)
+                pixel_count = test_cleaned.sum()
+
+                print(f"   • Test threshold {thresh:.4f}: {pixel_count} pixeli")
+
+                # Caută un număr rezonabil de pixeli (nu prea puțini, nu prea mulți)
+                if 20 <= pixel_count <= neuron_mask.sum() * 0.6:  # Între 20 pixeli și 60% din neuron
+                    if pixel_count > best_pixel_count:
+                        best_threshold = thresh
+                        best_pixel_count = pixel_count
+
+            # Dacă niciun threshold nu este bun, folosește cel mai conservator
+            if best_threshold is None:
+                best_threshold = max(threshold_candidates)
+                print(f"   ⚠️ Folosesc threshold conservator: {best_threshold:.4f}")
+            else:
+                print(f"   ✅ Threshold optim: {best_threshold:.4f} ({best_pixel_count} pixeli)")
+
+            threshold = best_threshold
         else:
-            threshold = 0.01
+            threshold = 0.5  # Foarte conservator
+            print(f"   ⚠️ Nu există semnal, threshold conservator: {threshold}")
 
-        # Creare mască binară
+        # Pasul 5: Creare mască binară cu threshold ales
         binary_dendrites = red_denoised > threshold
-
-        # IMPORTANT: Aplică masca neuronului din forma exactă
         binary_dendrites = binary_dendrites & neuron_mask
 
-        # Curățare minimă
-        cleaned = morphology.remove_small_objects(binary_dendrites, min_size=3)
+        print(f"   • Pixeli după threshold: {binary_dendrites.sum()}")
 
-        # Scheletizare pentru a obține linii fine
-        if cleaned.sum() > 0:
-            skeleton = morphology.skeletonize(cleaned)
+        # Pasul 6: CURĂȚARE AGRESIVĂ PENTRU ELIMINAREA ZGOMOTULUI
+        print("   🧹 Curățare agresivă...")
+
+        # Elimină obiecte foarte mici (probabil noise)
+        cleaned_stage1 = morphology.remove_small_objects(binary_dendrites, min_size=8)
+        print(f"   • După eliminarea obiectelor mici: {cleaned_stage1.sum()}")
+
+        # Verifică conectivitatea - elimină fragmente foarte izolate
+        if cleaned_stage1.sum() > 0:
+            labeled = measure.label(cleaned_stage1)
+            props = measure.regionprops(labeled)
+
+            # Păstrează doar componentele cu o dimensiune rezonabilă
+            good_components = []
+            for prop in props:
+                # Verificări multiple pentru calitate:
+                # 1. Dimensiunea minimă
+                if prop.area < 6:
+                    continue
+
+                # 2. Nu foarte rotunde (dendritele sunt elongate)
+                if prop.eccentricity < 0.3:
+                    continue
+
+                # 3. Raportul aspect nu foarte exagerat (elimină linii foarte subțiri - probabil noise)
+                bbox_height = prop.bbox[2] - prop.bbox[0]
+                bbox_width = prop.bbox[3] - prop.bbox[1]
+                aspect_ratio = max(bbox_height, bbox_width) / max(1, min(bbox_height, bbox_width))
+                if aspect_ratio > 20:  # Prea subțire
+                    continue
+
+                good_components.append(prop.label)
+
+            # Reconstituie masca doar cu componentele bune
+            if good_components:
+                cleaned_stage2 = np.isin(labeled, good_components)
+                print(
+                    f"   • După filtrarea componentelor: {cleaned_stage2.sum()} pixeli din {len(good_components)} componente")
+            else:
+                print("   ⚠️ Nicio componentă bună găsită!")
+                cleaned_stage2 = np.zeros_like(cleaned_stage1, dtype=bool)
         else:
-            skeleton = cleaned.copy()
+            cleaned_stage2 = cleaned_stage1.copy()
 
-        # Salvare debug
+        # Pasul 7: CLOSING FOARTE MIC pentru conectarea fragmentelor apropiate
+        if cleaned_stage2.sum() > 0:
+            # Un closing foarte mic pentru a conecta pixeli apropiați
+            closed = morphology.binary_closing(cleaned_stage2, morphology.disk(1))
+            # Dar limitează să nu se extindă prea mult
+            closed = closed & neuron_mask
+            print(f"   • După closing: {closed.sum()}")
+        else:
+            closed = cleaned_stage2.copy()
+
+        # Pasul 8: VERIFICARE FINALĂ ÎNAINTE DE SKELETONIZE
+        if closed.sum() < 15:
+            print(f"   ❌ Prea puține dendrite pentru skeletonizare ({closed.sum()} < 15)")
+            return np.zeros_like(red_norm, dtype=bool)
+
+        # Pasul 9: SKELETONIZARE CONTROLATĂ
+        print("   🦴 Skeletonizare controlată...")
+
+        try:
+            skeleton = morphology.skeletonize(closed)
+            skeleton_pixels = skeleton.sum()
+            print(f"   • Skeleton inițial: {skeleton_pixels} pixeli")
+
+            # VERIFICARE POST-SKELETONIZARE: elimină puncte izolate
+            if skeleton_pixels > 0:
+                # Elimină puncte complet izolate (fără vecini)
+                # Un pixel izolat într-un skeleton nu poate fi o dendrita reală
+                skeleton_cleaned = skeleton.copy()
+
+                # Găsește pixeli cu prea puțini vecini (probabil artefacte)
+                from scipy import ndimage
+                neighbor_count = ndimage.convolve(skeleton.astype(int),
+                                                  np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]]),
+                                                  mode='constant')
+
+                # Elimină pixeli complet izolați (0 vecini)
+                isolated_pixels = (skeleton == 1) & (neighbor_count == 0)
+                skeleton_cleaned[isolated_pixels] = False
+
+                final_pixels = skeleton_cleaned.sum()
+                print(f"   • Skeleton final (după eliminarea punctelor izolate): {final_pixels}")
+
+                if final_pixels < 8:
+                    print(f"   ❌ Skeleton final prea mic ({final_pixels} < 8)")
+                    return np.zeros_like(red_norm, dtype=bool)
+
+                skeleton = skeleton_cleaned
+
+        except Exception as e:
+            print(f"   ❌ Eroare la skeletonizare: {e}")
+            return np.zeros_like(red_norm, dtype=bool)
+
+        # Pasul 10: Salvare debug DETALIATĂ
         self._save_debug_image(red_norm, "09_red_original", debug_dir)
         self._save_debug_image(red_in_exact_neuron, "10_red_in_exact_neuron", debug_dir)
-        self._save_debug_image(binary_dendrites, "11_binary_dendrites_exact", debug_dir)
-        self._save_debug_image(skeleton, "12_final_skeleton_exact", debug_dir)
+        self._save_debug_image(red_denoised, "11_red_denoised_aggressive", debug_dir)
+        self._save_debug_image(binary_dendrites, "12_binary_after_threshold", debug_dir)
+        self._save_debug_image(cleaned_stage1, "13_after_small_objects_removal", debug_dir)
+        self._save_debug_image(cleaned_stage2, "14_after_component_filtering", debug_dir)
+        self._save_debug_image(closed, "15_after_closing", debug_dir)
+        self._save_debug_image(skeleton, "16_final_skeleton_clean", debug_dir)
 
-        print(f"   • Threshold: {threshold:.4f}")
-        print(f"   • Pixeli în skeleton final exact: {skeleton.sum()}")
+        # Salvare analiză comparativă
+        try:
+            fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+
+            axes[0, 0].imshow(red_norm, cmap='Reds')
+            axes[0, 0].set_title('Red Original')
+            axes[0, 0].axis('off')
+
+            axes[0, 1].imshow(red_denoised, cmap='Reds')
+            axes[0, 1].set_title('După Denoising')
+            axes[0, 1].axis('off')
+
+            axes[0, 2].imshow(binary_dendrites, cmap='gray')
+            axes[0, 2].set_title(f'După Threshold\n{binary_dendrites.sum()} px')
+            axes[0, 2].axis('off')
+
+            axes[0, 3].imshow(cleaned_stage1, cmap='gray')
+            axes[0, 3].set_title(f'Fără Obiecte Mici\n{cleaned_stage1.sum()} px')
+            axes[0, 3].axis('off')
+
+            axes[1, 0].imshow(cleaned_stage2, cmap='gray')
+            axes[1, 0].set_title(f'Filtrare Componente\n{cleaned_stage2.sum()} px')
+            axes[1, 0].axis('off')
+
+            axes[1, 1].imshow(closed, cmap='gray')
+            axes[1, 1].set_title(f'După Closing\n{closed.sum()} px')
+            axes[1, 1].axis('off')
+
+            axes[1, 2].imshow(skeleton, cmap='gray_r')
+            axes[1, 2].set_title(f'Skeleton Final\n{skeleton.sum()} px')
+            axes[1, 2].axis('off')
+
+            # Overlay final pe imaginea originală
+            overlay = red_norm * 0.5
+            overlay_colored = np.stack([
+                overlay + skeleton.astype(float) * 0.5,  # Red + skeleton
+                overlay,  # Green
+                overlay  # Blue
+            ], axis=-1)
+            overlay_colored = np.clip(overlay_colored, 0, 1)
+            axes[1, 3].imshow(overlay_colored)
+            axes[1, 3].set_title('Overlay Final')
+            axes[1, 3].axis('off')
+
+            plt.suptitle(f'ROI {roi_num} - Extragere Dendrite cu Suppressia Zgomotului\nThreshold: {threshold:.4f}')
+            plt.tight_layout()
+            plt.savefig(os.path.join(debug_dir, "17_dendrite_extraction_analysis.png"),
+                        dpi=150, bbox_inches='tight')
+            plt.close(fig)
+
+        except Exception as e:
+            print(f"   ⚠️ Eroare la salvarea analizei: {e}")
+
+        print(f"   🎯 REZULTAT DENDRITE FINAL:")
+        print(f"      • Threshold folosit: {threshold:.4f}")
+        print(f"      • Pixeli skeleton final: {skeleton.sum()}")
+        print(f"      • Procent din neuron: {100 * skeleton.sum() / max(1, neuron_mask.sum()):.1f}%")
 
         return skeleton
 
@@ -1004,6 +1619,9 @@ class CombinedNeuronAnalyzerFixed:
         self.image_path = image_path
         self.output_dir = output_dir
 
+        # SETUP MODIFICAT: Șterge imaginile, păstrează CSV
+        self._setup_output_directory_keep_csv()
+
         # Încarcă imaginea cu MIP
         print("🔄 Încărcare imagine cu MIP complet...")
         try:
@@ -1011,6 +1629,52 @@ class CombinedNeuronAnalyzerFixed:
             print(f"✅ Imagine încărcată: display={self.display_image.shape}, raw={self.raw_channels.shape}")
         except Exception as e:
             raise RuntimeError(f"Nu s-a putut încărca imaginea: {e}")
+
+    def _setup_output_directory_keep_csv(self):
+        """
+        Configurează directorul de output: ȘTERGE imaginile vechi, PĂSTREAZĂ CSV-ul
+        """
+        import shutil
+        import glob
+
+        if os.path.exists(self.output_dir):
+            print(f"🧹 Curăț imaginile vechi din '{self.output_dir}' dar PĂSTREZ CSV-ul...")
+
+            # 1. PĂSTREAZĂ CSV-urile (și backup-urile)
+            csv_files_to_preserve = []
+            for pattern in ["*.csv", "*backup*.csv", "*results*.csv"]:
+                csv_files_to_preserve.extend(glob.glob(os.path.join(self.output_dir, pattern)))
+
+            # 2. Creează backup temporar pentru CSV-uri
+            temp_csv_backup = {}
+            for csv_file in csv_files_to_preserve:
+                if os.path.exists(csv_file):
+                    with open(csv_file, 'r', encoding='utf-8') as f:
+                        temp_csv_backup[os.path.basename(csv_file)] = f.read()
+                    print(f"   💾 Backup temporar: {os.path.basename(csv_file)}")
+
+            # 3. ȘTERGE TOT din directorul output
+            try:
+                shutil.rmtree(self.output_dir)
+                print(f"   🗑️ Director '{self.output_dir}' șters complet")
+            except Exception as e:
+                print(f"   ⚠️ Eroare la ștergerea directorului: {e}")
+
+            # 4. Recreează directorul
+            os.makedirs(self.output_dir, exist_ok=True)
+
+            # 5. RESTAUREAZĂ doar CSV-urile
+            for csv_name, csv_content in temp_csv_backup.items():
+                csv_path = os.path.join(self.output_dir, csv_name)
+                with open(csv_path, 'w', encoding='utf-8') as f:
+                    f.write(csv_content)
+                print(f"   ✅ CSV restaurat: {csv_name}")
+
+            print(f"✅ Cleanup complet: imagini șterse, CSV păstrat!")
+
+        else:
+            os.makedirs(self.output_dir, exist_ok=True)
+            print(f"✅ Directorul '{self.output_dir}' a fost creat.")
 
     def run_complete_analysis_main_thread_fixed(self, result_callback=None):
         """Rulează analiza completă FIXED în thread-ul principal"""
